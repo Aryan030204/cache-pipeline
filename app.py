@@ -9,6 +9,15 @@ import requests
 from sqlalchemy import create_engine, text
 import concurrent.futures
 import multiprocessing
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(processName)s] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("cache_pipeline")
 
 load_dotenv()
 
@@ -35,18 +44,22 @@ if not BRANDS and TOTAL_CONFIG_COUNT > 0:
     BRANDS = derived
 
 if not BRANDS:
-    print("Warning: No brands configured. Set BRANDS or TOTAL_CONFIG_COUNT with BRAND_TAG_<i> in your .env.")
+    logger.warning("No brands configured. Set BRANDS or TOTAL_CONFIG_COUNT with BRAND_TAG_<i> in your .env.")
+else:
+    logger.info(f"Loaded brands: {BRANDS}")
+
 
 if not (UPSTASH_REDIS_URL or UPSTASH_REDIS_REST_URL):
-    print("Warning: No Upstash Redis URL configured; caching will be disabled.")
+    logger.warning("No Upstash Redis URL configured; caching will be disabled.")
 
 redis_client = None
 use_redis_rest = False
 if UPSTASH_REDIS_URL:
     try:
         redis_client = redis.from_url(UPSTASH_REDIS_URL, decode_responses=True)
+        logger.info("Connected to Upstash Redis via native client.")
     except Exception as e:
-        print("Failed to create redis client:", e)
+        logger.error(f"Failed to create redis client: {e}")
 elif UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
     use_redis_rest = True
 
@@ -93,20 +106,25 @@ def fetch_metrics_for_brand(brand: str) -> dict:
     If `<BRAND>_METRICS_QUERY` (uppercased) exists, it will be executed and the rows returned as `custom_rows`.
     Otherwise simple default COUNT(*) queries are attempted on `products`, `orders`, and `customers`.
     """
+    logger.info(f"[{brand}] Fetching metrics...")
     conn_str = get_conn_str_for_brand(brand)
     metrics = {"brand": brand, "timestamp": datetime.datetime.utcnow().isoformat() + "Z"}
 
     custom_query = os.getenv(f"{brand.upper()}_METRICS_QUERY") or os.getenv(f"BRAND_{brand.upper()}_METRICS_QUERY")
 
     if not conn_str:
+        logger.error(f"[{brand}] No connection string found.")
         metrics["error"] = "missing_connection_string"
         return metrics
+
+    logger.debug(f"[{brand}] Connection string found. Connecting to DB...")
 
     try:
         engine = create_engine(conn_str)
         with engine.connect() as conn:
             # Prefer explicit overall_summary latest-row read
             try:
+                logger.debug(f"[{brand}] Querying overall_summary table.")
                 q = text("SELECT * FROM overall_summary ORDER BY date DESC LIMIT 1")
                 res = conn.execute(q).first()
                 if res:
@@ -119,7 +137,9 @@ def fetch_metrics_for_brand(brand: str) -> dict:
                             except Exception:
                                 row[k] = str(v)
                     metrics["overall_summary"] = row
+                    logger.info(f"[{brand}] Successfully fetched from overall_summary.")
                 else:
+                    logger.info(f"[{brand}] overall_summary table empty or missing.")
                     # fallback: if empty, allow custom query or generic counts
                     if custom_query:
                         res2 = conn.execute(text(custom_query))
@@ -143,7 +163,9 @@ def fetch_metrics_for_brand(brand: str) -> dict:
                         metrics["custom_rows"] = rows
                     except Exception as e2:
                         metrics["error"] = str(e2)
+                        logger.error(f"[{brand}] Custom query failed: {e2}")
                 else:
+                    logger.debug(f"[{brand}] Falling back to generic COUNT(*) queries.")
                     counts = {}
                     for name, q2 in [("products", "SELECT COUNT(*) AS c FROM products"), ("orders", "SELECT COUNT(*) AS c FROM orders"), ("customers", "SELECT COUNT(*) AS c FROM customers")]:
                         try:
@@ -153,6 +175,7 @@ def fetch_metrics_for_brand(brand: str) -> dict:
                             counts[name] = None
                     metrics["counts"] = counts
     except Exception as e:
+        logger.error(f"[{brand}] DB connection/query error: {e}")
         metrics["error"] = str(e)
 
     return metrics
@@ -196,7 +219,7 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
         try:
             prev_val = redis_client.get(key)
         except Exception as e:
-            print("Redis GET failed:", e)
+            logger.error(f"Redis GET failed: {e}")
     elif use_redis_rest:
         try:
             r = requests.get(UPSTASH_REDIS_REST_URL.rstrip("/") + f"/get/{key}", headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}, timeout=10)
@@ -205,14 +228,15 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
                 # Upstash REST /get returns { "result": <value> }
                 prev_val = j.get("result")
         except Exception as e:
-            print("Upstash REST GET failed:", e)
+            logger.error(f"Upstash REST GET failed: {e}")
 
     # Set primary key to new payload
     if redis_client:
         try:
             redis_client.set(key, payload, ex=ex)
+            logger.debug(f"Redis SET {key} success.")
         except Exception as e:
-            print("Redis SET failed:", e)
+            logger.error(f"Redis SET failed: {e}")
             return False
     elif use_redis_rest:
         try:
@@ -223,13 +247,13 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
                 body["ex"] = ex
             r = requests.post(url, headers=headers, json=body, timeout=10)
             if r.status_code not in (200, 201):
-                print("Upstash REST set failed:", r.status_code, r.text)
+                logger.error(f"Upstash REST set failed: {r.status_code} {r.text}")
                 return False
         except Exception as e:
-            print("Upstash REST request failed:", e)
+            logger.error(f"Upstash REST request failed: {e}")
             return False
     else:
-        print("No cache configured for key", key)
+        logger.warning(f"No cache configured for key {key}")
         return False
 
     # Preserve previous under key:old with TTL so it gets deleted automatically
@@ -238,8 +262,9 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
         if redis_client:
             try:
                 redis_client.set(old_key, prev_val, ex=preserve_seconds)
+                logger.debug(f"Redis SET {old_key} (preserve) success.")
             except Exception as e:
-                print("Redis set old failed:", e)
+                logger.error(f"Redis set old failed: {e}")
         elif use_redis_rest:
             try:
                 url = UPSTASH_REDIS_REST_URL.rstrip("/") + f"/set/{old_key}"
@@ -249,7 +274,7 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
                 if r.status_code not in (200, 201):
                     print("Upstash REST set old failed:", r.status_code, r.text)
             except Exception as e:
-                print("Upstash REST request failed when setting old:", e)
+                logger.error(f"Upstash REST request failed when setting old: {e}")
 
     return True
 
@@ -271,13 +296,18 @@ def fetch_and_cache_all() -> dict:
         r = fetch_metrics_for_brand(brand)
         try:
             ok = atomic_cache_replace(f"metrics:{brand}", r, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
-            if not ok:
+            if ok:
+                logger.info(f"[{brand}] Cached successfully (TTL={METRICS_TTL}s).")
+            else:
+                logger.error(f"[{brand}] Cache update failed.")
                 r.setdefault("cache_error", "failed_to_cache")
         except Exception as e:
+            logger.error(f"[{brand}] Cache exception: {e}")
             r.setdefault("cache_error", str(e))
         return brand, r
 
     max_workers = compute_max_workers()
+    logger.info(f"Starting fetch_and_cache_all with {max_workers} max_workers for {len(BRANDS)} brands.")
     if len(BRANDS) <= 1:
         # simple sequential path
         for brand in BRANDS:
@@ -304,10 +334,15 @@ def qstash_hook():
     # `Authorization: Bearer <token>` header. If not set, the endpoint accepts requests without verification.
     if QSTASH_TOKEN:
         auth = request.headers.get("Authorization", "")
+        logger.info(f"Received QStash webhook. Auth header present: {bool(auth)}")
         if auth != f"Bearer {QSTASH_TOKEN}":
+            logger.warning("Unauthorized QStash request.")
             return ("unauthorized", 401)
+    else:
+        logger.info("Received QStash webhook (No Token Verification enabled).")
 
     results = fetch_and_cache_all()
+    logger.info("QStash pipeline run completed. Returning results.")
     return jsonify({"status": "ok", "results": results})
 
 
