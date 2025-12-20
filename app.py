@@ -33,6 +33,7 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 METRICS_TTL = int(os.getenv("CACHE_TTL_SECONDS", os.getenv("METRICS_TTL_SECONDS", "86400")))
 CACHE_PRESERVE_OLD_SECONDS = int(os.getenv("CACHE_PRESERVE_OLD_SECONDS", os.getenv("CACHE_PRESERVE_OLD", "3600")))
 QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
+BACKFILL_MODE = os.getenv("BACKFILL_MODE", "false").lower() == "true"
 
 if not BRANDS and TOTAL_CONFIG_COUNT > 0:
     # derive brand tags from BRAND_TAG_i or SHOP_NAME_i
@@ -294,6 +295,10 @@ def fetch_and_cache_all() -> dict:
 
     def process_brand(brand: str):
         r = fetch_metrics_for_brand(brand)
+        if BACKFILL_MODE:
+            logger.info(f"[{brand}] BACKFILL_MODE enabled. Skipping cache update.")
+            return brand, r
+
         try:
             ok = atomic_cache_replace(f"metrics:{brand}", r, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
             if ok:
