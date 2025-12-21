@@ -230,6 +230,7 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
 
     if redis_client:
         try:
+            # Always overwrite existing key to ensure latest values are cached
             redis_client.set(key, payload, ex=ex)
             return True
         except Exception as e:
@@ -276,6 +277,9 @@ def fetch_and_cache_all() -> dict:
     if not brands_list:
         brands_list = [f"brand_{i}" for i in range(1, 6)]
     
+    logger.info(f"Pipeline started. Brands to process: {len(brands_list)}")
+
+    
     # --- 1. Determine Anchor Date ---
     # Logic:
     # - If BACKFILL_MODE=true AND TARGET_DATE set -> Anchor = TARGET_DATE
@@ -321,6 +325,7 @@ def fetch_and_cache_all() -> dict:
         for brand in brands_list:
             # Task: Fetch & Cache for 'dates_to_cache'
             for date_str in dates_to_cache:
+                logger.info(f"[{brand}] Triggering fetch for {date_str}...")
                 future = executor.submit(fetch_metrics_for_brand, brand, date_str)
                 future_to_item[future] = (brand, date_str, "CACHE")
             
@@ -337,10 +342,12 @@ def fetch_and_cache_all() -> dict:
                 data = future.result()
                 
                 if "error" in data:
-                     logger.error(f"[{brand}] Failed {date_str}: {data['error']}")
+                     logger.error(f"[{brand}] Failed to fetch metrics for {date_str}: {data['error']}")
                      if brand not in results: results[brand] = {}
                      results[brand][date_str] = f"Error: {data['error']}"
                      continue
+                
+                logger.info(f"[{brand}] Fetched metrics for {date_str}. Now caching...")
 
                 # Cache
                 cache_key = f"metrics:{brand}:{date_str}"
@@ -353,6 +360,11 @@ def fetch_and_cache_all() -> dict:
                 
                 success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
                 status = "OK" if success else "CACHE_FAIL"
+                
+                if success:
+                    logger.info(f"[{brand}] Successfully cached data for {date_str}. Key: {cache_key}")
+                else:
+                    logger.error(f"[{brand}] Failed to write to cache for {date_str}.")
                 
                 if brand not in results: results[brand] = {}
                 results[brand][date_str] = status
@@ -375,11 +387,14 @@ def qstash_hook():
         if auth != f"Bearer {QSTASH_TOKEN}":
             logger.warning("Unauthorized QStash request.")
             return ("unauthorized", 401)
+        else:
+            logger.info("QStash request authorized.")
     else:
         logger.info("Received QStash webhook (No Token Verification enabled).")
 
+    logger.info("Starting pipeline execution via QStash trigger...")
     results = fetch_and_cache_all()
-    logger.info("QStash pipeline run completed. Returning results.")
+    logger.info(f"QStash pipeline run completed. Results summary: {json.dumps(results)}")
     return jsonify({"status": "ok", "results": results})
 
 
