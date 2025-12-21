@@ -459,15 +459,25 @@ def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
             return False
     elif use_redis_rest:
         try:
+            # Upstash standard REST "SET" command:
+            # 1. To set just value: POST /set/key body="value"
+            # 2. To set with EX: POST /set/key?ex=seconds body="value"
+            # We want to store RAW string, not a JSON object wrapper.
+            
             url = UPSTASH_REDIS_REST_URL.rstrip("/") + f"/set/{key}"
-            headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}", "Content-Type": "application/json"}
-            body = {"value": payload}
             if ex:
-                body["ex"] = ex
-            r = requests.post(url, headers=headers, json=body, timeout=10)
+                url += f"?ex={ex}"
+            
+            headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+            # Send raw string as body to ensure it's not double-JSON encoded or wrapped
+            r = requests.post(url, headers=headers, data=payload, timeout=10)
+            
             if r.status_code not in (200, 201):
                 logger.error(f"Upstash REST set failed: {r.status_code} {r.text}")
                 return False
+        except Exception as e:
+            logger.error(f"Upstash REST request failed: {e}")
+            return False
         except Exception as e:
             logger.error(f"Upstash REST request failed: {e}")
             return False
@@ -650,24 +660,8 @@ def get_metrics():
         try:
             cached_val = redis_client.get(cache_key)
             if cached_val:
-                # Parse JSON
-                data = json.loads(cached_val)
-                
-                # Robustness: Check if data is wrapped in {"ex": ..., "value": "..."}
-                # This can happen if previously saved via Upstash-style body dict
-                if isinstance(data, dict) and "value" in data and "ex" in data:
-                    # Unwrap one level
-                    try:
-                        inner = data["value"]
-                        # Inner might be a JSON string
-                        if isinstance(inner, str):
-                            data = json.loads(inner)
-                        else:
-                            data = inner
-                    except:
-                        pass # Keep original if unwrap fails
-                
-                return jsonify(data)
+                # cached_val is a JSON string, load it to return proper JSON object
+                return jsonify(json.loads(cached_val))
             else:
                 return jsonify({"error": "Data not found for this date. Run pipeline first."}), 404
         except Exception as e:
