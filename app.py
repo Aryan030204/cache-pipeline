@@ -650,8 +650,24 @@ def get_metrics():
         try:
             cached_val = redis_client.get(cache_key)
             if cached_val:
-                # cached_val is a JSON string, load it to return proper JSON object
-                return jsonify(json.loads(cached_val))
+                # Parse JSON
+                data = json.loads(cached_val)
+                
+                # Robustness: Check if data is wrapped in {"ex": ..., "value": "..."}
+                # This can happen if previously saved via Upstash-style body dict
+                if isinstance(data, dict) and "value" in data and "ex" in data:
+                    # Unwrap one level
+                    try:
+                        inner = data["value"]
+                        # Inner might be a JSON string
+                        if isinstance(inner, str):
+                            data = json.loads(inner)
+                        else:
+                            data = inner
+                    except:
+                        pass # Keep original if unwrap fails
+                
+                return jsonify(data)
             else:
                 return jsonify({"error": "Data not found for this date. Run pipeline first."}), 404
         except Exception as e:
