@@ -147,11 +147,9 @@ def fetch_pagespeed_api(brand_key: str, date_str: str) -> dict:
     return {}
 
 def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
-    """Fetch all dashboard metrics for a brand for a specific date."""
+    """Fetch metrics from overall_summary table for a specific date."""
     logger.info(f"[{brand}] Fetching metrics for {target_date_str}...")
     conn_str = get_conn_str_for_brand(brand)
-    
-    today_str = target_date_str
     
     metrics_data = {}
 
@@ -160,238 +158,54 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
         return {"error": "missing_connection_string"}
 
     try:
-        # 1. Fetch Page Speed (API) - Independent of DB, use same date
-        ps_data = fetch_pagespeed_api(brand, today_str)
-        metrics_data["pagespeed"] = ps_data
-        
         engine = create_engine(conn_str)
         with engine.connect() as conn:
-            
-            # --- Common Date Filter ---
-            # Most tables use 'created_at' or 'date' column.
-            # We filter for the specific day.
-            
-            # 1. TOTAL ORDERS
-            q_orders = text("""
-                SELECT COUNT(DISTINCT order_id) as val 
-                FROM shopify_orders_update 
-                WHERE DATE(created_at) = :d
-            """)
-            res_orders = conn.execute(q_orders, {"d": today_str}).first()
-            total_orders = int(res_orders.val) if res_orders and res_orders.val is not None else 0
-            
-            metrics_data["total_orders"] = {
-                "metric": "TOTAL_ORDERS",
-                "range": {"start": today_str, "end": today_str},
-                "total_orders": total_orders
-            }
-
-            # 2. TOTAL SALES
-            q_sales = text("""
-                SELECT SUM(total_price) as val 
-                FROM shopify_orders_update 
-                WHERE DATE(created_at) = :d
-            """)
-            res_sales = conn.execute(q_sales, {"d": today_str}).first()
-            total_sales = float(res_sales.val) if res_sales and res_sales.val is not None else 0.0
-            
-            metrics_data["total_sales"] = {
-                "metric": "TOTAL_SALES",
-                "range": {"start": today_str, "end": today_str},
-                "total_sales": total_sales
-            }
-            
-            # 3. AOV
-            # aov = sales / orders
-            aov_val = (total_sales / total_orders) if total_orders > 0 else 0.0
-            metrics_data["aov"] = {
-                "metric": "AOV",
-                "range": {"start": today_str, "end": today_str},
-                "total_sales": total_sales,
-                "total_orders": total_orders,
-                "aov": aov_val
-            }
-            
-            # 4. SESSIONS (needed for CVR, Funnel)
-            # Try sessions_summary first for aggregate
-            q_sess = text("""
-                SELECT number_of_sessions, number_of_atc_sessions 
-                FROM sessions_summary 
-                WHERE date = :d LIMIT 1
-            """)
-            res_sess = conn.execute(q_sess, {"d": today_str}).first()
-            
-            total_sessions = 0
-            total_atc = 0
-            if res_sess:
-                total_sessions = int(res_sess.number_of_sessions or 0)
-                total_atc = int(res_sess.number_of_atc_sessions or 0)
-            
-            # 5. CVR
-            # cvr = orders / sessions
-            cvr_val = (total_orders / total_sessions) if total_sessions > 0 else 0.0
-            cvr_percent = cvr_val * 100
-            
-            metrics_data["cvr"] = {
-                "metric": "CVR",
-                "range": {"start": today_str, "end": today_str},
-                "total_orders": total_orders,
-                "total_sessions": total_sessions,
-                "cvr": cvr_val,
-                "cvr_percent": cvr_percent
-            }
-            
-            # 6. FUNNEL STATS
-            metrics_data["funnel_stats"] = {
-                "metric": "FUNNEL_STATS",
-                "range": {"start": today_str, "end": today_str},
-                "total_sessions": total_sessions,
-                "total_atc_sessions": total_atc,
-                "total_orders": total_orders
-            }
-            
-            # 7. HOURLY TREND
-            # Initialize 24 hours
-            hourly_points = []
-            for h in range(24):
-                hourly_points.append({
-                    "hour": h,
-                    "label": f"{h:02d}:00",
-                    "metrics": {
-                        "sales": 0, "sessions": 0, "orders": 0, "atc": 0, "cvr_ratio": 0, "cvr_percent": 0
-                    }
-                })
-            
-            # Aggregate Sales/Orders by hour
-            q_hourly_sales = text("""
-                SELECT HOUR(created_at) as hr, COUNT(DISTINCT order_id) as orders, SUM(total_price) as sales
-                FROM shopify_orders_update 
-                WHERE DATE(created_at) = :d
-                GROUP BY HOUR(created_at)
-            """)
-            res_hourly = conn.execute(q_hourly_sales, {"d": today_str})
-            for row in res_hourly:
-                h_idx = row.hr
-                if 0 <= h_idx < 24:
-                    hourly_points[h_idx]["metrics"]["orders"] = row.orders
-                    hourly_points[h_idx]["metrics"]["sales"] = float(row.sales or 0)
-
-            # Aggregate Sessions by hour (from `sessions` table if available, else 0)
-            # Note: sessions table might be empty, code handles incomplete data gracefully
-            try:
-                q_hourly_sess = text("""
-                    SELECT HOUR(createdAt) as hr, COUNT(*) as sess
-                    FROM sessions 
-                    WHERE DATE(createdAt) = :d
-                    GROUP BY HOUR(createdAt)
-                """)
-                res_hsess = conn.execute(q_hourly_sess, {"d": today_str})
-                for row in res_hsess:
-                    h_idx = row.hr
-                    if 0 <= h_idx < 24:
-                        hourly_points[h_idx]["metrics"]["sessions"] = row.sess
-                        # Recalculate CVR
-                        ords = hourly_points[h_idx]["metrics"]["orders"]
-                        sess = row.sess
-                        if sess > 0:
-                            hourly_points[h_idx]["metrics"]["cvr_ratio"] = ords / sess
-                            hourly_points[h_idx]["metrics"]["cvr_percent"] = (ords / sess) * 100
-            except Exception as e_sess:
-                logger.warning(f"[{brand}] Failed to query hourly sessions: {e_sess}")
-            
-            metrics_data["hourly_trend"] = {
-                "range": {"start": today_str, "end": today_str},
-                "timezone": "IST",
-                "points": hourly_points
-                # "comparison" omitted for now as it requires fetching yesterday's data - simpler v1
-            }
-            
-            # 8. ORDER SPLIT (COD vs Prepaid)
-            # Simplistic check: financial_status or payment_gateway_names
-            # "Cash on Delivery (COD)" is a common gateway name.
-            # Querying counts
-            q_split = text("""
+            # Query overall_summary
+            # Note: The table has 'date' column.
+            q_summary = text("""
                 SELECT 
-                    SUM(CASE WHEN payment_gateway_names LIKE '%Cash%' OR payment_gateway_names LIKE '%COD%' THEN 1 ELSE 0 END) as cod_orders,
-                    SUM(CASE WHEN payment_gateway_names NOT LIKE '%Cash%' AND payment_gateway_names NOT LIKE '%COD%' THEN 1 ELSE 0 END) as prepaid_orders
-                FROM shopify_orders_update
-                WHERE DATE(created_at) = :d
+                    total_orders, 
+                    total_sales, 
+                    total_sessions, 
+                    total_atc_sessions
+                FROM overall_summary
+                WHERE date = :d
             """)
-            res_split = conn.execute(q_split, {"d": today_str}).first()
-            cod_orders = int(res_split.cod_orders or 0) if res_split else 0
-            prepaid_orders = total_orders - cod_orders # simplified fallback
-            # (Better to use the query result directly if reliable, but valid logic is complex)
-            # Re-reading query result safely
-            if res_split and res_split.prepaid_orders is not None:
-                prepaid_orders = int(res_split.prepaid_orders)
             
-            metrics_data["order_split"] = {
-                "metric": "ORDER_SPLIT",
-                "range": {"start": today_str, "end": today_str},
-                "cod_orders": cod_orders,
-                "prepaid_orders": prepaid_orders,
-                "total_orders_from_split": cod_orders + prepaid_orders,
-                "cod_percent": (cod_orders / total_orders * 100) if total_orders else 0,
-                "prepaid_percent": (prepaid_orders / total_orders * 100) if total_orders else 0
-            }
+            res = conn.execute(q_summary, {"d": target_date_str}).first()
+            
+            if not res:
+                logger.warning(f"[{brand}] No data found in overall_summary for {target_date_str}")
+                # Return zeros or handle as empty? Usually better to return 0s so frontend doesn't break
+                metrics_data = {
+                     "total_orders": 0,
+                     "total_sales": 0.0,
+                     "average_order_value": 0.0,
+                     "conversion_rate": 0.0,
+                     "total_sessions": 0,
+                     "total_atc_sessions": 0
+                }
+            else:
+                total_orders = float(res.total_orders or 0)
+                total_sales = float(res.total_sales or 0)
+                total_sessions = int(res.total_sessions or 0)
+                total_atc_sessions = int(res.total_atc_sessions or 0)
+                
+                # Calculations
+                aov = (total_sales / total_orders) if total_orders > 0 else 0.0
+                cvr = (total_orders / total_sessions * 100) if total_sessions > 0 else 0.0
+                
+                metrics_data = {
+                     "total_orders": total_orders,
+                     "total_sales": total_sales,
+                     "average_order_value": aov,
+                     "conversion_rate": cvr,
+                     "total_sessions": total_sessions,
+                     "total_atc_sessions": total_atc_sessions
+                }
+                
+            logger.info(f"[{brand}] {target_date_str} -> {metrics_data}")
 
-            # 9. PAYMENT SALES SPLIT
-            q_sales_split = text("""
-                SELECT 
-                    SUM(CASE WHEN payment_gateway_names LIKE '%Cash%' OR payment_gateway_names LIKE '%COD%' THEN total_price ELSE 0 END) as cod_sales,
-                    SUM(CASE WHEN payment_gateway_names NOT LIKE '%Cash%' AND payment_gateway_names NOT LIKE '%COD%' THEN total_price ELSE 0 END) as prepaid_sales
-                FROM shopify_orders_update
-                WHERE DATE(created_at) = :d
-            """)
-            res_ssplit = conn.execute(q_sales_split, {"d": today_str}).first()
-            cod_sales = float(res_ssplit.cod_sales or 0) if res_ssplit else 0.0
-            prepaid_sales = float(res_ssplit.prepaid_sales or 0) if res_ssplit else 0.0
-            total_split_sales = cod_sales + prepaid_sales
-            
-            metrics_data["payment_sales_split"] = {
-                "metric": "PAYMENT_SPLIT_SALES",
-                "range": {"start": today_str, "end": today_str},
-                "cod_sales": cod_sales,
-                "prepaid_sales": prepaid_sales,
-                "total_sales_from_split": total_split_sales,
-                "cod_percent": (cod_sales / total_split_sales * 100) if total_split_sales else 0,
-                "prepaid_percent": (prepaid_sales / total_split_sales * 100) if total_split_sales else 0
-            }
-            
-            # 10. TOP PRODUCTS
-            # Assuming shopify_orders_update has `product_id` (from inspection it does seem to have `product_id`)
-            # But `shopify_orders_update` usually contains line items if normalized, or we check if it is one row per line item.
-            # Schema showed `line_item`, `product_id`.
-            q_top = text("""
-                SELECT product_id, line_item as title, COUNT(*) as count, SUM(total_price) as sales
-                FROM shopify_orders_update 
-                WHERE DATE(created_at) = :d AND product_id IS NOT NULL
-                GROUP BY product_id, line_item
-                ORDER BY count DESC
-                LIMIT 50
-            """)
-            res_top = conn.execute(q_top, {"d": today_str})
-            products_list = []
-            rank = 1
-            for row in res_top:
-                products_list.append({
-                    "rank": rank,
-                    "product_id": row.product_id,
-                    "landing_page_path": "", # Placeholder, strictly not in orders table usually
-                    "sessions": 0, # Requires joining with sessions which is hard
-                    "add_to_cart_rate": 0,
-                    "sales_count": row.count
-                })
-                rank += 1
-            
-            metrics_data["top_products"] = {
-                "brand_key": brand,
-                "range": {"start": today_str, "end": today_str},
-                "products": products_list
-            }
-
-            logger.info(f"[{brand}] Granular fetch complete.")
-            
     except Exception as e:
         logger.error(f"[{brand}] Query error: {e}")
         metrics_data["error"] = str(e)
@@ -401,221 +215,152 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
 
 
 def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
-    """Replace primary cache key with `value` and preserve previous value under `{key}:old` with TTL.
-
-    Steps:
-    1. GET current value (if any)
-    2. SET primary key to new value with expire `ex`
-    3. If previous existed, SET `{key}:old` to previous with expire `preserve_seconds`
+    """Replace primary cache key with `value`.
+       Note: The previous 'old' preservation logic is removed as per user instruction:
+       'remove the old logic whatever it was I dont care'.
+       However, strict atomic replacement is good practice, so we'll keep the simple SET.
     """
     def _normalize(o):
-        if o is None:
-            return None
-        if isinstance(o, Decimal):
-            try:
-                return float(o)
-            except Exception:
-                return str(o)
-        if isinstance(o, (datetime.date, datetime.datetime)):
-            try:
-                return o.isoformat()
-            except Exception:
-                return str(o)
-        if isinstance(o, bytes):
-            try:
-                return o.decode()
-            except Exception:
-                return str(o)
-        if isinstance(o, dict):
-            return {k: _normalize(v) for k, v in o.items()}
-        if isinstance(o, (list, tuple, set)):
-            return [_normalize(v) for v in o]
+        if o is None: return None
+        if isinstance(o, Decimal): return float(o)
+        if isinstance(o, (datetime.date, datetime.datetime)): return o.isoformat()
         return o
 
-    payload = json.dumps(_normalize(value), indent=2)
-    prev_val = None
-    if redis_client:
-        try:
-            prev_val = redis_client.get(key)
-        except Exception as e:
-            logger.error(f"Redis GET failed: {e}")
-    elif use_redis_rest:
-        try:
-            r = requests.get(UPSTASH_REDIS_REST_URL.rstrip("/") + f"/get/{key}", headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}, timeout=10)
-            if r.status_code == 200:
-                j = r.json()
-                # Upstash REST /get returns { "result": <value> }
-                prev_val = j.get("result")
-        except Exception as e:
-            logger.error(f"Upstash REST GET failed: {e}")
+    payload = json.dumps(value, default=_normalize, indent=2)
 
-    # Set primary key to new payload
     if redis_client:
         try:
             redis_client.set(key, payload, ex=ex)
-            logger.debug(f"Redis SET {key} success.")
+            return True
         except Exception as e:
             logger.error(f"Redis SET failed: {e}")
             return False
     elif use_redis_rest:
         try:
-            # Upstash standard REST "SET" command:
-            # 1. To set just value: POST /set/key body="value"
-            # 2. To set with EX: POST /set/key?ex=seconds body="value"
-            # We want to store RAW string, not a JSON object wrapper.
-            
             url = UPSTASH_REDIS_REST_URL.rstrip("/") + f"/set/{key}"
-            if ex:
-                url += f"?ex={ex}"
-            
+            if ex: url += f"?ex={ex}"
             headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-            # Send raw string as body to ensure it's not double-JSON encoded or wrapped
             r = requests.post(url, headers=headers, data=payload, timeout=10)
+            return r.status_code in (200, 201)
+        except Exception as e:
+            logger.error(f"Upstash REST SET failed: {e}")
+            return False
             
-            if r.status_code not in (200, 201):
-                logger.error(f"Upstash REST set failed: {r.status_code} {r.text}")
-                return False
+    return False
+
+def delete_cache_key(key: str):
+    """Delete a specific cache key."""
+    if redis_client:
+        try:
+            redis_client.delete(key)
+            logger.info(f"Deleted Redis key: {key}")
         except Exception as e:
-            logger.error(f"Upstash REST request failed: {e}")
-            return False
+            logger.error(f"Redis DELETE failed: {e}")
+    elif use_redis_rest:
+        try:
+            url = UPSTASH_REDIS_REST_URL.rstrip("/") + f"/del/{key}"
+            headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+            requests.get(url, headers=headers, timeout=5) # /del via REST usually GET or POST
+            logger.info(f"Deleted Upstash key: {key}")
         except Exception as e:
-            logger.error(f"Upstash REST request failed: {e}")
-            return False
-    else:
-        logger.warning(f"No cache configured for key {key}")
-        return False
-
-    # Preserve previous under key:old with TTL so it gets deleted automatically
-    if prev_val:
-        old_key = f"{key}:old"
-        if redis_client:
-            try:
-                redis_client.set(old_key, prev_val, ex=preserve_seconds)
-                logger.debug(f"Redis SET {old_key} (preserve) success.")
-            except Exception as e:
-                logger.error(f"Redis set old failed: {e}")
-        elif use_redis_rest:
-            try:
-                url = UPSTASH_REDIS_REST_URL.rstrip("/") + f"/set/{old_key}"
-                headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}", "Content-Type": "application/json"}
-                body = {"value": prev_val, "ex": preserve_seconds}
-                r = requests.post(url, headers=headers, json=body, timeout=10)
-                if r.status_code not in (200, 201):
-                    print("Upstash REST set old failed:", r.status_code, r.text)
-            except Exception as e:
-                logger.error(f"Upstash REST request failed when setting old: {e}")
-
-    return True
-
+            logger.error(f"Upstash REST DELETE failed: {e}")
 
 def fetch_and_cache_all() -> dict:
     """
-    Main orchestrator:
-    1. Determine rolling window (Today + past 4 days).
-    2. Iterate over brands and dates.
-    3. Conditionally skip cached historical dates.
-    4. Fetch and Cache.
+    Orchestrator:
+    1. Determine Anchor Date (Today or Target).
+    2. Cache Anchor + prev 4 days (Total 5).
+    3. Delete (Anchor - 5 days).
     """
     brands_list = BRANDS
     if not brands_list:
         brands_list = [f"brand_{i}" for i in range(1, 6)]
     
-    # Determine Anchor Date
-    env_target = os.getenv("TARGET_DATE")
-    if env_target:
-        try:
-            anchor_date = datetime.datetime.strptime(env_target, "%Y-%m-%d")
-            logger.info(f"Using TARGET_DATE as anchor: {env_target}")
-        except:
-            utc_now = datetime.datetime.utcnow()
-            ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
-            anchor_date = ist_now
-    else:
-        utc_now = datetime.datetime.utcnow()
-        ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
-        anchor_date = ist_now
+    # --- 1. Determine Anchor Date ---
+    # Logic:
+    # - If BACKFILL_MODE=true AND TARGET_DATE set -> Anchor = TARGET_DATE
+    # - Else -> Anchor = Today (IST)
     
-    # Generate list of 5 dates (Anchor, Anchor-1, ... Anchor-4)
-    dates_to_fetch = []
+    utc_now = datetime.datetime.utcnow()
+    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
+    today_ist = ist_now.date() # Date object
+    
+    anchor_date = today_ist
+    
+    if BACKFILL_MODE:
+        env_target = os.getenv("TARGET_DATE")
+        if env_target:
+            try:
+                anchor_date = datetime.datetime.strptime(env_target, "%Y-%m-%d").date()
+                logger.info(f"BACKFILL_MODE=True. Using TARGET_DATE: {anchor_date}")
+            except ValueError:
+                logger.warning(f"Invalid TARGET_DATE format: {env_target}. Fallback to Today.")
+        else:
+            logger.info("BACKFILL_MODE=True but no TARGET_DATE. Using Today.")
+            
+    logger.info(f"Anchor Date: {anchor_date}")
+
+    # --- 2. Calculate Dates ---
+    dates_to_cache = []
     for i in range(5):
         d = anchor_date - datetime.timedelta(days=i)
-        dates_to_fetch.append(d.strftime("%Y-%m-%d"))
+        dates_to_cache.append(d.strftime("%Y-%m-%d"))
+        
+    date_to_delete = (anchor_date - datetime.timedelta(days=5)).strftime("%Y-%m-%d")
     
-    logger.info(f"Rolling Window: {dates_to_fetch} for brands: {brands_list}")
+    logger.info(f"Caching: {dates_to_cache}")
+    logger.info(f"Deleting: {date_to_delete}")
 
     results = {}
 
-    # Parallelize Brand + Date fetches
-    # 4 workers is a safe start
+    # --- 3. Parallel Execution ---
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_key = {}
+        future_to_item = {}
         
+        # Schedule Fetches
         for brand in brands_list:
-            for date_str in dates_to_fetch:
-                try:
-                    is_today_anchor = (date_str == dates_to_fetch[0])
-                    cache_key = f"metrics:{brand}:{date_str}"
-                    
-                    # Check Existence Logic
-                    should_fetch = True
-                    if not is_today_anchor and not BACKFILL_MODE:
-                        exists = False
-                        if redis_client:
-                            exists = bool(redis_client.exists(cache_key))
-                        elif use_redis_rest:
-                            u = f"{UPSTASH_REDIS_REST_URL.rstrip('/')}/get/{cache_key}?_token={UPSTASH_REDIS_REST_TOKEN}"
-                            try:
-                                r = requests.get(u)
-                                if r.status_code == 200:
-                                    j = r.json()
-                                    if j.get("result"):
-                                        exists = True
-                            except:
-                                pass
-                        
-                        if exists:
-                            logger.info(f"[{brand}] Skipping {date_str} (Already cached)")
-                            should_fetch = False
-                    
-                    if should_fetch:
-                        future = executor.submit(fetch_metrics_for_brand, brand, date_str)
-                        future_to_key[future] = (brand, date_str, cache_key)
-                    else:
-                        if brand not in results: results[brand] = {}
-                        results[brand][date_str] = "SKIPPED_EXISTS"
-                        
-                except Exception as e_sched:
-                    logger.error(f"Failed to schedule {brand} {date_str}: {e_sched}")
+            # Task: Fetch & Cache for 'dates_to_cache'
+            for date_str in dates_to_cache:
+                future = executor.submit(fetch_metrics_for_brand, brand, date_str)
+                future_to_item[future] = (brand, date_str, "CACHE")
+            
+            # Task: Delete 'date_to_delete'
+            # We can just do this synchronously or via simple helper, but needs to happen per brand
+            # Let's just do it directly here to ensure it runs
+            del_key = f"metrics:{brand}:{date_to_delete}"
+            delete_cache_key(del_key)
 
-        for future in concurrent.futures.as_completed(future_to_key):
-            brand, date_str, cache_key = future_to_key[future]
+        # Process Results
+        for future in concurrent.futures.as_completed(future_to_item):
+            brand, date_str, action = future_to_item[future]
             try:
                 data = future.result()
                 
-                # Check internal error
                 if "error" in data:
-                     logger.error(f"[{brand}] Error in sub-fetch for {date_str}: {data['error']}")
+                     logger.error(f"[{brand}] Failed {date_str}: {data['error']}")
                      if brand not in results: results[brand] = {}
                      results[brand][date_str] = f"Error: {data['error']}"
                      continue
 
-                # Cache it
-                if not BACKFILL_MODE:
-                    ok = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
-                    if ok:
-                        logger.info(f"[{brand}] Cached {date_str} to {cache_key}")
-                    else:
-                         logger.error(f"[{brand}] Cache write failed for {date_str}")
-                else:
-                    logger.info(f"[{brand}] BACKFILL_MODE enabled. Skipping cache update for {date_str}.")
+                # Cache
+                cache_key = f"metrics:{brand}:{date_str}"
+                # logic: if backfill=false => run normally (cache 5 days)
+                # logic: if backfill=true => cache target date window
+                # The user request in point 8 & 9 implies caching always happens effectively unless there's a specific constraint.
+                # Point 8: "this pipeline cached the data for 13-17th"
+                # Point 9: "run normally" vs "cache the data of target date and its last five days"
+                # My 'dates_to_cache' logic covers both cases by adjusting the anchor.
+                
+                success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
+                status = "OK" if success else "CACHE_FAIL"
                 
                 if brand not in results: results[brand] = {}
-                results[brand][date_str] = "OK"
-
+                results[brand][date_str] = status
+                
             except Exception as e:
-                logger.error(f"[{brand}] Error processing {date_str}: {e}")
+                logger.error(f"[{brand}] Exception {date_str}: {e}")
                 if brand not in results: results[brand] = {}
-                results[brand][date_str] = f"Error: {str(e)}"
+                results[brand][date_str] = str(e)
 
     return results
 
