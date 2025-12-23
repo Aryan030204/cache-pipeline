@@ -61,6 +61,9 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 redis_client = None
 use_redis_rest = False
 
+# Database Engine Cache (prevent connection leak)
+ENGINES = {}
+
 if REDIS_URL:
     try:
         # Standard Redis Client (TCP)
@@ -158,7 +161,20 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
         return {"error": "missing_connection_string"}
 
     try:
-        engine = create_engine(conn_str)
+        if conn_str not in ENGINES:
+            # Create a cached engine with strict connection pooling limits
+            # pool_size: number of persistent connections to keep per brand
+            # max_overflow: do not allow additional connections beyond pool_size
+            ENGINES[conn_str] = create_engine(
+                conn_str,
+                pool_size=2,          # Keep pool small
+                max_overflow=0,       # Disable overflow
+                pool_pre_ping=True,   # Check if connection is alive before use
+                pool_recycle=300      # Recycle connections every 5 mins
+            )
+            logger.info(f"[{brand}] Created new database engine (pooled).")
+        
+        engine = ENGINES[conn_str]
         with engine.connect() as conn:
             # Query overall_summary
             # Note: The table has 'date' column.
