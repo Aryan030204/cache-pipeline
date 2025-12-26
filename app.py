@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import redis
 import requests
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 import concurrent.futures
 import multiprocessing
 import logging
@@ -162,17 +163,13 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
 
     try:
         if conn_str not in ENGINES:
-            # Create a cached engine with strict connection pooling limits
-            # pool_size: number of persistent connections to keep per brand
-            # max_overflow: do not allow additional connections beyond pool_size
+            # Create a cached engine with NullPool to close connections immediately after use
+            # This prevents "Too many connections" errors by not holding idle connections.
             ENGINES[conn_str] = create_engine(
                 conn_str,
-                pool_size=2,          # Keep pool small
-                max_overflow=0,       # Disable overflow
-                pool_pre_ping=True,   # Check if connection is alive before use
-                pool_recycle=300      # Recycle connections every 5 mins
+                poolclass=NullPool
             )
-            logger.info(f"[{brand}] Created new database engine (pooled).")
+            logger.info(f"[{brand}] Created new database engine (NullPool).")
         
         engine = ENGINES[conn_str]
         with engine.connect() as conn:
@@ -228,6 +225,57 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
         logger.exception("Traceback:")
 
     return metrics_data
+
+
+def fetch_hourly_metrics_for_brand(brand: str, target_date_str: str) -> list:
+    """Fetch hourly data from hour_wise_sales table for a specific date."""
+    logger.info(f"[{brand}] Fetching HOURLY metrics for {target_date_str}...")
+    conn_str = get_conn_str_for_brand(brand)
+    
+    hourly_data = []
+
+    if not conn_str:
+        logger.error(f"[{brand}] No connection string found.")
+        return []
+
+    try:
+        # Use existing engine or create new one (logic depends on if we share the ENGINES dict, which we do)
+        if conn_str not in ENGINES:
+             ENGINES[conn_str] = create_engine(conn_str, poolclass=NullPool)
+        
+        engine = ENGINES[conn_str]
+        with engine.connect() as conn:
+            q = text("""
+                SELECT 
+                    hour, 
+                    number_of_orders, 
+                    total_sales, 
+                    number_of_sessions, 
+                    number_of_atc_sessions
+                FROM hour_wise_sales
+                WHERE date = :d
+                ORDER BY hour ASC
+            """)
+            
+            rows = conn.execute(q, {"d": target_date_str}).fetchall()
+            
+            for r in rows:
+                hourly_data.append({
+                    "hour": int(r.hour),
+                    "number_of_orders": float(r.number_of_orders or 0),
+                    "total_sales": float(r.total_sales or 0),
+                    "number_of_sessions": int(r.number_of_sessions or 0),
+                    "number_of_atc_sessions": int(r.number_of_atc_sessions or 0)
+                })
+                
+            logger.info(f"[{brand}] Fetched {len(hourly_data)} hours for {target_date_str}")
+
+    except Exception as e:
+        logger.error(f"[{brand}] Hourly Query error: {e}")
+        # Return empty list on error to avoid breaking the pipeline, or could raise
+        logger.exception("Traceback:")
+
+    return hourly_data
 
 
 def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
@@ -331,10 +379,19 @@ def fetch_and_cache_all() -> dict:
     logger.info(f"Caching: {dates_to_cache}")
     logger.info(f"Deleting: {date_to_delete}")
 
+    # --- Hourly Dates (Today + Yesterday) ---
+    hourly_dates = [
+        anchor_date.strftime("%Y-%m-%d"),
+        (anchor_date - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    ]
+    hourly_delete_date = (anchor_date - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+    logger.info(f"Hourly Caching: {hourly_dates}")
+    logger.info(f"Hourly Deleting: {hourly_delete_date}")
+
     results = {}
 
     # --- 3. Parallel Execution ---
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_item = {}
         
         # Schedule Fetches
@@ -351,12 +408,33 @@ def fetch_and_cache_all() -> dict:
             del_key = f"metrics:{brand}:{date_to_delete}"
             delete_cache_key(del_key)
 
+            # Task: Fetch & Cache HOURLY (Today + Yesterday)
+            for h_date in hourly_dates:
+                logger.info(f"[{brand}] Triggering HOURLY fetch for {h_date}...")
+                future_h = executor.submit(fetch_hourly_metrics_for_brand, brand, h_date)
+                future_to_item[future_h] = (brand, h_date, "HOURLY_CACHE")
+
+            # Task: Delete old hourly
+            del_h_key = f"hourly_metrics:{brand}:{hourly_delete_date}"
+            delete_cache_key(del_h_key)
+
         # Process Results
         for future in concurrent.futures.as_completed(future_to_item):
             brand, date_str, action = future_to_item[future]
             try:
                 data = future.result()
                 
+                if action == "HOURLY_CACHE":
+                    # Hourly Data Handling
+                    cache_key = f"hourly_metrics:{brand}:{date_str}"
+                    # Data is a list of dicts or empty list
+                    success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
+                    status = "OK_HOURLY" if success else "CACHE_FAIL_HOURLY"
+                    if brand not in results: results[brand] = {}
+                    results[brand][f"{date_str}_hourly"] = status
+                    logger.info(f"[{brand}] Cached HOURLY for {date_str}. Status: {status}")
+                    continue
+
                 if "error" in data:
                      logger.error(f"[{brand}] Failed to fetch metrics for {date_str}: {data['error']}")
                      if brand not in results: results[brand] = {}
@@ -391,6 +469,14 @@ def fetch_and_cache_all() -> dict:
                 results[brand][date_str] = str(e)
 
     return results
+
+
+@app.route("/trigger-pipeline", methods=["GET"])
+def manual_trigger():
+    logger.info("Received manual pipeline trigger request.")
+    results = fetch_and_cache_all()
+    logger.info(f"Manual pipeline run completed. Results: {json.dumps(results)}")
+    return jsonify({"status": "ok", "results": results})
 
 
 @app.route("/qstash", methods=["POST"])
