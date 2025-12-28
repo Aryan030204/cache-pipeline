@@ -11,6 +11,7 @@ from sqlalchemy.pool import NullPool
 import concurrent.futures
 import multiprocessing
 import logging
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -64,6 +65,30 @@ use_redis_rest = False
 
 # Database Engine Cache (prevent connection leak)
 ENGINES = {}
+
+def get_or_create_engine(conn_str: str, brand: str):
+    """Get existing engine or create new one with SSL config."""
+    if conn_str in ENGINES:
+        return ENGINES[conn_str]
+    
+    try:
+        # Enable SSL but skip verification since we don't have the CA cert
+        ssl_args = {
+            "ssl_disabled": False,
+            "ssl_verify_cert": False,
+            "ssl_verify_identity": False
+        }
+        
+        ENGINES[conn_str] = create_engine(
+            conn_str,
+            poolclass=NullPool,
+            connect_args=ssl_args
+        )
+        logger.info(f"[{brand}] Created new database engine (NullPool) with SSL.")
+        return ENGINES[conn_str]
+    except Exception as e:
+        logger.error(f"[{brand}] Failed to create engine: {e}")
+        raise
 
 if REDIS_URL:
     try:
@@ -162,17 +187,14 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
         return {"error": "missing_connection_string"}
 
     try:
-        if conn_str not in ENGINES:
-            # Create a cached engine with NullPool to close connections immediately after use
-            # This prevents "Too many connections" errors by not holding idle connections.
-            ENGINES[conn_str] = create_engine(
-                conn_str,
-                poolclass=NullPool
-            )
-            logger.info(f"[{brand}] Created new database engine (NullPool).")
+        # Use helper to get engine with SSL config
+        t0 = time.time()
+        engine = get_or_create_engine(conn_str, brand)
         
-        engine = ENGINES[conn_str]
         with engine.connect() as conn:
+            t1 = time.time()
+            logger.info(f"[{brand}] DB Connect took {t1 - t0:.2f}s")
+            
             # Query overall_summary
             # Note: The table has 'date' column.
             q_summary = text("""
@@ -186,6 +208,8 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
             """)
             
             res = conn.execute(q_summary, {"d": target_date_str}).first()
+            t2 = time.time()
+            logger.info(f"[{brand}] Query Execution took {t2 - t1:.2f}s")
             
             if not res:
                 logger.warning(f"[{brand}] No data found in overall_summary for {target_date_str}")
@@ -239,12 +263,13 @@ def fetch_hourly_metrics_for_brand(brand: str, target_date_str: str) -> list:
         return []
 
     try:
-        # Use existing engine or create new one (logic depends on if we share the ENGINES dict, which we do)
-        if conn_str not in ENGINES:
-             ENGINES[conn_str] = create_engine(conn_str, poolclass=NullPool)
-        
-        engine = ENGINES[conn_str]
+        # Use helper to get engine with SSL config
+        t0 = time.time()
+        engine = get_or_create_engine(conn_str, brand)
         with engine.connect() as conn:
+            t1 = time.time()
+            logger.info(f"[{brand}] (Hourly) DB Connect took {t1 - t0:.2f}s")
+            
             q = text("""
                 SELECT 
                     hour, 
@@ -258,6 +283,8 @@ def fetch_hourly_metrics_for_brand(brand: str, target_date_str: str) -> list:
             """)
             
             rows = conn.execute(q, {"d": target_date_str}).fetchall()
+            t2 = time.time()
+            logger.info(f"[{brand}] (Hourly) Query Execution took {t2 - t1:.2f}s")
             
             for r in rows:
                 hourly_data.append({

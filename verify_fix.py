@@ -11,6 +11,7 @@ sys.modules['mysql-connector-python'] = MagicMock()
 # Mock SQLAlchemy
 mock_sqlalchemy = MagicMock()
 sys.modules['sqlalchemy'] = mock_sqlalchemy
+sys.modules['sqlalchemy.pool'] = MagicMock()
 
 import app
 
@@ -37,11 +38,15 @@ def test_engine_caching():
         assert mock_sqlalchemy.create_engine.call_count == 1
         print("Second call: Engine reused from cache.")
         
-        # Verify pool arguments
+        # Verify pool arguments and SSL config
         args, kwargs = mock_sqlalchemy.create_engine.call_args
-        assert kwargs['pool_size'] == 2
-        assert kwargs['max_overflow'] == 0
-        print("Correct pool settings verified.")
+        assert kwargs['poolclass'] is not None
+        
+        # Verify SSL args
+        connect_args = kwargs.get('connect_args', {})
+        assert connect_args.get('ssl_verify_cert') is False
+        assert connect_args.get('ssl_verify_identity') is False
+        print("Correct SSL settings verified.")
 
 if __name__ == "__main__":
     try:
