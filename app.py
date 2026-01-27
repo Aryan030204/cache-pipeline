@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import json
 import datetime
+import ssl
 from decimal import Decimal
 from dotenv import load_dotenv
 import redis
@@ -72,12 +73,21 @@ def get_or_create_engine(conn_str: str, brand: str):
         return ENGINES[conn_str]
     
     try:
-        # Enable SSL but skip verification since we don't have the CA cert
-        ssl_args = {
-            "ssl_disabled": False,
-            "ssl_verify_cert": False,
-            "ssl_verify_identity": False
-        }
+        # Determine driver and set appropriate SSL arguments
+        if "mysqlconnector" in conn_str:
+            # Arguments for mysql-connector-python
+            ssl_args = {
+                "ssl_disabled": False,
+                "ssl_verify_cert": False,
+                "ssl_verify_identity": False
+            }
+        else:
+            # Arguments for pymysql (default or specified)
+            # Create an SSL context that skips verification to match previous behavior
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ssl_args = {"ssl": ctx}
         
         ENGINES[conn_str] = create_engine(
             conn_str,
