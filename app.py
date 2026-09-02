@@ -37,6 +37,7 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 METRICS_TTL = int(os.getenv("CACHE_TTL_SECONDS", os.getenv("METRICS_TTL_SECONDS", "86400")))
 CACHE_PRESERVE_OLD_SECONDS = int(os.getenv("CACHE_PRESERVE_OLD_SECONDS", os.getenv("CACHE_PRESERVE_OLD", "3600")))
 QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
+QSTASH_COMPLETION_TOKEN = os.getenv("QSTASH_COMPLETION_TOKEN")
 BACKFILL_MODE = os.getenv("BACKFILL_MODE", "false").lower() == "true"
 
 # Tenant/brand config service
@@ -577,12 +578,12 @@ def manual_trigger():
 
 @app.route("/qstash", methods=["POST"])
 def qstash_hook():
-    # Optional token-based verification for QStash — set `QSTASH_TOKEN` in .env and make QStash send
-    # `Authorization: Bearer <token>` header. If not set, the endpoint accepts requests without verification.
-    if QSTASH_TOKEN:
+    # Optional token-based verification for QStash — set `QSTASH_COMPLETION_TOKEN` in .env and make QStash
+    # send `Authorization: Bearer <token>` header. If not set, the endpoint accepts requests without verification.
+    if QSTASH_COMPLETION_TOKEN:
         auth = request.headers.get("Authorization", "")
         logger.info(f"Received QStash webhook. Auth header present: {bool(auth)}")
-        if auth != f"Bearer {QSTASH_TOKEN}":
+        if auth != f"Bearer {QSTASH_COMPLETION_TOKEN}":
             logger.warning("Unauthorized QStash request.")
             return ("unauthorized", 401)
         else:
