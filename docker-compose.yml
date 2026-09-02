@@ -1,0 +1,15 @@
+services:
+  cache-pipeline:
+    build: .
+    container_name: cache-pipeline
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    networks:
+      - pipeline-net
+
+networks:
+  pipeline-net:
+    external: true
