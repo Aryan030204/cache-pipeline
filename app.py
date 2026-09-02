@@ -12,7 +12,7 @@ import certifi
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from sqlalchemy import create_engine, text
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 import concurrent.futures
 import multiprocessing
 import logging
@@ -197,10 +197,14 @@ def build_engine(brand_tag: str, cfg: dict):
 
         ENGINES[conn_str] = create_engine(
             conn_str,
-            poolclass=NullPool,
+            poolclass=QueuePool,
+            pool_size=3,
+            max_overflow=2,
+            pool_recycle=280,
+            pool_pre_ping=True,
             connect_args=connect_args
         )
-        logger.info(f"[{brand_tag}] Created new database engine (NullPool) with SSL verify={ssl_verify}.")
+        logger.info(f"[{brand_tag}] Created new database engine (QueuePool) with SSL verify={ssl_verify}.")
         return ENGINES[conn_str]
     except Exception as e:
         logger.error(f"[{brand_tag}] Failed to create engine: {e}")
