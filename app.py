@@ -269,19 +269,25 @@ def fetch_metrics_for_brand(brand: str, cfg: dict, target_date_str: str) -> dict
             # Query overall_summary
             # Note: The table has 'date' column.
             q_summary = text("""
-                SELECT 
-                    total_orders, 
-                    total_sales, 
-                    total_sessions, 
-                    total_atc_sessions
+                SELECT
+                    total_orders,
+                    total_sales,
+                    total_sessions,
+                    total_atc_sessions,
+                    cod_orders,
+                    prepaid_orders,
+                    partially_paid_orders,
+                    cod_sales,
+                    prepaid_sales,
+                    partially_prepaid_sales
                 FROM overall_summary
                 WHERE date = :d
             """)
-            
+
             res = conn.execute(q_summary, {"d": target_date_str}).first()
             t2 = time.time()
             logger.info(f"[{brand}] Query Execution took {t2 - t1:.2f}s")
-            
+
             if not res:
                 logger.warning(f"[{brand}] No data found in overall_summary for {target_date_str}")
                 # Return zeros or handle as empty? Usually better to return 0s so frontend doesn't break
@@ -291,27 +297,43 @@ def fetch_metrics_for_brand(brand: str, cfg: dict, target_date_str: str) -> dict
                      "average_order_value": 0.0,
                      "conversion_rate": 0.0,
                      "total_sessions": 0,
-                     "total_atc_sessions": 0
+                     "total_atc_sessions": 0,
+                     "payment_breakdown": {
+                         "prepaid_orders": 0,
+                         "cod_orders": 0,
+                         "partially_paid_orders": 0,
+                         "prepaid_sales": 0.0,
+                         "cod_sales": 0.0,
+                         "partially_paid_sales": 0.0
+                     }
                 }
             else:
                 total_orders = float(res.total_orders or 0)
                 total_sales = float(res.total_sales or 0)
                 total_sessions = int(res.total_sessions or 0)
                 total_atc_sessions = int(res.total_atc_sessions or 0)
-                
+
                 # Calculations
                 aov = (total_sales / total_orders) if total_orders > 0 else 0.0
                 cvr = (total_orders / total_sessions * 100) if total_sessions > 0 else 0.0
-                
+
                 metrics_data = {
                      "total_orders": total_orders,
                      "total_sales": total_sales,
                      "average_order_value": aov,
                      "conversion_rate": cvr,
                      "total_sessions": total_sessions,
-                     "total_atc_sessions": total_atc_sessions
+                     "total_atc_sessions": total_atc_sessions,
+                     "payment_breakdown": {
+                         "prepaid_orders": int(res.prepaid_orders or 0),
+                         "cod_orders": int(res.cod_orders or 0),
+                         "partially_paid_orders": int(res.partially_paid_orders or 0),
+                         "prepaid_sales": float(res.prepaid_sales or 0),
+                         "cod_sales": float(res.cod_sales or 0),
+                         "partially_paid_sales": float(res.partially_prepaid_sales or 0)
+                     }
                 }
-                
+
             logger.info(f"[{brand}] {target_date_str} -> {metrics_data}")
 
     except Exception as e:
@@ -369,6 +391,110 @@ def fetch_hourly_metrics_for_brand(brand: str, cfg: dict, target_date_str: str) 
         logger.exception("Traceback:")
 
     return hourly_data
+
+
+def _compute_preset_ranges(anchor: datetime.date) -> dict:
+    """Return {preset_name: (start_date, end_date)} (both inclusive) for the given anchor date.
+
+    Rolling windows (7/30/90 days) exclude the anchor itself (completed days only).
+    month_to_date is the only preset that includes the anchor.
+    """
+    last_month_end = anchor.replace(day=1) - datetime.timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+    return {
+        "last_7_days": (anchor - datetime.timedelta(days=7), anchor - datetime.timedelta(days=1)),
+        "last_30_days": (anchor - datetime.timedelta(days=30), anchor - datetime.timedelta(days=1)),
+        "last_90_days": (anchor - datetime.timedelta(days=90), anchor - datetime.timedelta(days=1)),
+        "last_month": (last_month_start, last_month_end),
+        "month_to_date": (anchor.replace(day=1), anchor),
+    }
+
+
+def fetch_date_preset_metrics_for_brand(brand: str, cfg: dict, anchor_date: datetime.date) -> dict:
+    """Fetch summed metrics from overall_summary for fixed date-range presets
+    (last_7_days, last_30_days, last_90_days, last_month, month_to_date)."""
+    logger.info(f"[{brand}] Fetching date-preset metrics (anchor={anchor_date})...")
+
+    ranges = _compute_preset_ranges(anchor_date)
+    query_start = min(r[0] for r in ranges.values())
+    query_end = anchor_date
+
+    result = {}
+
+    try:
+        t0 = time.time()
+        engine = build_engine(brand, cfg)
+        with engine.connect() as conn:
+            t1 = time.time()
+            logger.info(f"[{brand}] (Presets) DB Connect took {t1 - t0:.2f}s")
+
+            q = text("""
+                SELECT
+                    date,
+                    total_orders,
+                    total_sales,
+                    total_sessions,
+                    total_atc_sessions,
+                    cod_orders,
+                    prepaid_orders,
+                    partially_paid_orders,
+                    cod_sales,
+                    prepaid_sales,
+                    partially_prepaid_sales
+                FROM overall_summary
+                WHERE date BETWEEN :start AND :end
+            """)
+            rows = conn.execute(q, {"start": query_start, "end": query_end}).fetchall()
+            t2 = time.time()
+            logger.info(f"[{brand}] (Presets) Query Execution took {t2 - t1:.2f}s")
+
+        for preset_name, (start, end) in ranges.items():
+            orders = sales = sessions = atc = 0.0
+            prepaid_orders = cod_orders = partially_paid_orders = 0.0
+            prepaid_sales = cod_sales = partially_paid_sales = 0.0
+            for r in rows:
+                if start <= r.date <= end:
+                    orders += float(r.total_orders or 0)
+                    sales += float(r.total_sales or 0)
+                    sessions += float(r.total_sessions or 0)
+                    atc += float(r.total_atc_sessions or 0)
+                    prepaid_orders += float(r.prepaid_orders or 0)
+                    cod_orders += float(r.cod_orders or 0)
+                    partially_paid_orders += float(r.partially_paid_orders or 0)
+                    prepaid_sales += float(r.prepaid_sales or 0)
+                    cod_sales += float(r.cod_sales or 0)
+                    partially_paid_sales += float(r.partially_prepaid_sales or 0)
+
+            aov = (sales / orders) if orders > 0 else 0.0
+            cvr = (orders / sessions * 100) if sessions > 0 else 0.0
+
+            result[preset_name] = {
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "total_orders": orders,
+                "total_sales": sales,
+                "average_order_value": aov,
+                "conversion_rate": cvr,
+                "total_sessions": int(sessions),
+                "total_atc_sessions": int(atc),
+                "payment_breakdown": {
+                    "prepaid_orders": int(prepaid_orders),
+                    "cod_orders": int(cod_orders),
+                    "partially_paid_orders": int(partially_paid_orders),
+                    "prepaid_sales": prepaid_sales,
+                    "cod_sales": cod_sales,
+                    "partially_paid_sales": partially_paid_sales
+                }
+            }
+
+        logger.info(f"[{brand}] Date-preset metrics computed: {list(result.keys())}")
+
+    except Exception as e:
+        logger.error(f"[{brand}] Date-preset query error: {e}")
+        result["error"] = str(e)
+        logger.exception("Traceback:")
+
+    return result
 
 
 def atomic_cache_replace(key: str, value: dict, ex: int, preserve_seconds: int):
@@ -515,6 +641,10 @@ def fetch_and_cache_all() -> dict:
             del_h_key = f"hourly_metrics:{brand}:{hourly_delete_date}"
             delete_cache_key(del_h_key)
 
+            # Task: Fetch & Cache date-preset aggregates (7/30/90-day, last month, MTD)
+            future_p = executor.submit(fetch_date_preset_metrics_for_brand, brand, cfg, anchor_date)
+            future_to_item[future_p] = (brand, "date_presets", "DATE_PRESETS")
+
         # Process Results
         for future in concurrent.futures.as_completed(future_to_item):
             brand, date_str, action = future_to_item[future]
@@ -530,6 +660,21 @@ def fetch_and_cache_all() -> dict:
                     if brand not in results: results[brand] = {}
                     results[brand][f"{date_str}_hourly"] = status
                     logger.info(f"[{brand}] Cached HOURLY for {date_str}. Status: {status}")
+                    continue
+
+                if action == "DATE_PRESETS":
+                    if "error" in data:
+                        logger.error(f"[{brand}] Failed to fetch date-preset metrics: {data['error']}")
+                        if brand not in results: results[brand] = {}
+                        results[brand]["date_presets"] = f"Error: {data['error']}"
+                        continue
+
+                    cache_key = f"date_presets:{brand}"
+                    success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
+                    status = "OK_PRESETS" if success else "CACHE_FAIL_PRESETS"
+                    if brand not in results: results[brand] = {}
+                    results[brand]["date_presets"] = status
+                    logger.info(f"[{brand}] Cached date presets. Status: {status}")
                     continue
 
                 if "error" in data:
