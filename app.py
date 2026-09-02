@@ -616,7 +616,7 @@ def fetch_and_cache_all() -> dict:
     results = {}
 
     # --- 3. Parallel Execution ---
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv("PIPELINE_MAX_WORKERS", "8"))) as executor:
         future_to_item = {}
         
         # Schedule Fetches
