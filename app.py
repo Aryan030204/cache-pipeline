@@ -1,12 +1,16 @@
 from flask import Flask, request, jsonify
 import os
 import json
+import base64
 import datetime
 import ssl
 from decimal import Decimal
 from dotenv import load_dotenv
 import redis
 import requests
+import certifi
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 import concurrent.futures
@@ -27,9 +31,6 @@ load_dotenv()
 app = Flask(__name__)
 
 # Environment configuration
-# Primary brand list: use BRANDS if provided; otherwise derive brands from indexed config variables
-BRANDS = [b.strip() for b in os.getenv("BRANDS", "").split(",") if b.strip()]
-TOTAL_CONFIG_COUNT = int(os.getenv("TOTAL_CONFIG_COUNT", "0"))
 UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
@@ -38,19 +39,90 @@ CACHE_PRESERVE_OLD_SECONDS = int(os.getenv("CACHE_PRESERVE_OLD_SECONDS", os.gete
 QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
 BACKFILL_MODE = os.getenv("BACKFILL_MODE", "false").lower() == "true"
 
-if not BRANDS and TOTAL_CONFIG_COUNT > 0:
-    # derive brand tags from BRAND_TAG_i or SHOP_NAME_i
-    derived = []
-    for i in range(TOTAL_CONFIG_COUNT):
-        tag = os.getenv(f"BRAND_TAG_{i}") or os.getenv(f"X_BRAND_NAME_{i}") or os.getenv(f"SHOP_NAME_{i}")
-        if tag:
-            derived.append(tag)
-    BRANDS = derived
+# Tenant/brand config service
+GET_BRANDS_API = os.getenv("GET_BRANDS_API")
+PIPELINE_AUTH_HEADER = os.getenv("PIPELINE_AUTH_HEADER")
+PASSWORD_AES_KEY = os.getenv("PASSWORD_AES_KEY")
+BRAND_CONFIG_CACHE_TTL_SECONDS = int(os.getenv("BRAND_CONFIG_CACHE_TTL_SECONDS", "300"))
 
-if not BRANDS:
-    logger.warning("No brands configured. Set BRANDS or TOTAL_CONFIG_COUNT with BRAND_TAG_<i> in your .env.")
-else:
-    logger.info(f"Loaded brands: {BRANDS}")
+if not GET_BRANDS_API or not PIPELINE_AUTH_HEADER or not PASSWORD_AES_KEY:
+    logger.warning("GET_BRANDS_API / PIPELINE_AUTH_HEADER / PASSWORD_AES_KEY not fully configured. Brand config will be unavailable.")
+
+
+def decrypt_value(encrypted_str: str) -> str:
+    """Decrypt an AES-256-CBC value formatted as iv_b64:ciphertext_b64."""
+    if not encrypted_str or ":" not in encrypted_str:
+        return encrypted_str
+    iv_b64, cipher_b64 = encrypted_str.split(":", 1)
+    iv = base64.b64decode(iv_b64)
+    cipher = base64.b64decode(cipher_b64)
+    key = PASSWORD_AES_KEY.encode("utf-8").ljust(32, b"\0")[:32]
+    aes = AES.new(key, AES.MODE_CBC, iv)
+    return unpad(aes.decrypt(cipher), AES.block_size).decode("utf-8")
+
+
+_brand_config_cache = {"data": None, "fetched_at": 0.0}
+
+
+def fetch_active_brands(force_refresh: bool = False) -> dict:
+    """Return {brand_tag: brand_config_dict} for brands where is_active is True.
+
+    TTL-cached (BRAND_CONFIG_CACHE_TTL_SECONDS) unless force_refresh=True.
+    On fetch failure, falls back to the last known-good cached value.
+    """
+    now = time.time()
+    if not force_refresh and _brand_config_cache["data"] is not None and \
+            (now - _brand_config_cache["fetched_at"]) < BRAND_CONFIG_CACHE_TTL_SECONDS:
+        return _brand_config_cache["data"]
+
+    if not GET_BRANDS_API or not PIPELINE_AUTH_HEADER:
+        logger.error("GET_BRANDS_API or PIPELINE_AUTH_HEADER missing. Cannot fetch brands.")
+        return _brand_config_cache["data"] or {}
+
+    headers = {"x-pipeline-key": PIPELINE_AUTH_HEADER}
+
+    try:
+        resp = requests.get(GET_BRANDS_API, headers=headers, timeout=15)
+        resp.raise_for_status()
+        brands_map = resp.json()  # {brand_id: db_database}
+    except Exception as e:
+        logger.error(f"Failed to fetch brands list from {GET_BRANDS_API}: {e}")
+        return _brand_config_cache["data"] or {}
+
+    configs = {}
+    for brand_id in brands_map:
+        try:
+            detail_resp = requests.get(f"{GET_BRANDS_API.rstrip('/')}/{brand_id}", headers=headers, timeout=15)
+            detail_resp.raise_for_status()
+            detail = detail_resp.json()
+
+            if detail.get("is_active") is not True:
+                continue
+
+            tag = detail.get("brand_tag")
+            if not tag:
+                logger.warning(f"Brand id {brand_id} has no brand_tag, skipping.")
+                continue
+
+            configs[tag] = {
+                "brand_id": brand_id,
+                "brand_tag": tag,
+                "brand_name": detail.get("brand_name"),
+                "db_host": detail["db_host"],
+                "db_port": int(detail.get("port", 3306)),
+                "db_user": detail["db_user"],
+                "db_password": decrypt_value(detail["db_password"]),
+                "db_database": detail["db_database"],
+                "access_token": decrypt_value(detail.get("access_token", "")),
+                "shop_name": detail.get("shop_name"),
+            }
+        except Exception as e:
+            logger.error(f"Failed loading brand id {brand_id}: {e}")
+
+    _brand_config_cache["data"] = configs
+    _brand_config_cache["fetched_at"] = now
+    logger.info(f"Loaded {len(configs)} active brands: {list(configs.keys())}")
+    return configs
 
 
 # Redis Configuration
@@ -67,37 +139,70 @@ use_redis_rest = False
 # Database Engine Cache (prevent connection leak)
 ENGINES = {}
 
-def get_or_create_engine(conn_str: str, brand: str):
-    """Get existing engine or create new one with SSL config."""
+
+def _resolve_ca_bundle_path():
+    """Resolve the CA bundle path to use for DB SSL verification, per DB_TLS_CA_MODE."""
+    mode = os.getenv("DB_TLS_CA_MODE", "certifi").strip().lower()
+    if mode == "none":
+        return None
+    if mode == "rds":
+        write_path = os.getenv("RDS_CA_WRITE_PATH", "/tmp/rds-ca.pem")
+        ca_url = os.getenv("RDS_CA_URL", "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem")
+        try:
+            if os.path.exists(write_path) and os.path.getsize(write_path) > 0:
+                return write_path
+            os.makedirs(os.path.dirname(write_path) or ".", exist_ok=True)
+            resp = requests.get(ca_url, timeout=30)
+            resp.raise_for_status()
+            if b"BEGIN CERTIFICATE" not in resp.content:
+                raise RuntimeError("Downloaded CA bundle does not look like a PEM certificate file.")
+            with open(write_path, "wb") as f:
+                f.write(resp.content)
+            return write_path
+        except Exception as e:
+            logger.error(f"Failed to obtain RDS CA bundle, falling back to certifi: {e}")
+            return certifi.where()
+    # default: certifi
+    return certifi.where()
+
+
+def build_engine(brand_tag: str, cfg: dict):
+    """Get existing engine or create new one for a brand's DB, with SSL config."""
+    conn_str = (
+        f"mysql+pymysql://{cfg['db_user']}:{cfg['db_password']}@"
+        f"{cfg['db_host']}:{cfg['db_port']}/{cfg['db_database']}?charset=utf8mb4"
+    )
     if conn_str in ENGINES:
         return ENGINES[conn_str]
-    
+
     try:
-        # Determine driver and set appropriate SSL arguments
-        if "mysqlconnector" in conn_str:
-            # Arguments for mysql-connector-python
-            ssl_args = {
-                "ssl_disabled": False,
-                "ssl_verify_cert": False,
-                "ssl_verify_identity": False
-            }
-        else:
-            # Arguments for pymysql (default or specified)
-            # Create an SSL context that skips verification to match previous behavior
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            ssl_args = {"ssl": ctx}
-        
+        connect_args = {}
+        ssl_verify = os.getenv("DB_SSL_VERIFY", "true").strip().lower() == "true"
+        if ssl_verify:
+            ca_path = _resolve_ca_bundle_path()
+            ctx = ssl.create_default_context(cafile=ca_path) if ca_path else ssl.create_default_context()
+
+            verify_cert = os.getenv("DB_SSL_VERIFY_CERT", "true").strip().lower() == "true"
+            verify_identity = os.getenv("DB_SSL_VERIFY_IDENTITY", "false").strip().lower() == "true"
+
+            host = cfg["db_host"]
+            if "elb.amazonaws.com" in host or ("amazonaws.com" in host and "rds.amazonaws.com" not in host):
+                # NLB/ELB hostnames won't match the RDS cert's CN/SAN - never verify identity against them.
+                verify_identity = False
+
+            ctx.check_hostname = verify_identity
+            ctx.verify_mode = ssl.CERT_REQUIRED if verify_cert else ssl.CERT_NONE
+            connect_args = {"ssl": ctx}
+
         ENGINES[conn_str] = create_engine(
             conn_str,
             poolclass=NullPool,
-            connect_args=ssl_args
+            connect_args=connect_args
         )
-        logger.info(f"[{brand}] Created new database engine (NullPool) with SSL.")
+        logger.info(f"[{brand_tag}] Created new database engine (NullPool) with SSL verify={ssl_verify}.")
         return ENGINES[conn_str]
     except Exception as e:
-        logger.error(f"[{brand}] Failed to create engine: {e}")
+        logger.error(f"[{brand_tag}] Failed to create engine: {e}")
         raise
 
 if REDIS_URL:
@@ -116,46 +221,6 @@ if not redis_client and UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
     use_redis_rest = True
     logger.info("Configured for Upstash Redis REST API")
 
-
-def brand_index_map():
-    """Return mapping brand -> index based on indexed env vars when BRANDS wasn't explicitly set.
-
-    If BRANDS was provided by name, we still attempt to find an index by matching BRAND_TAG_i or SHOP_NAME_i.
-    """
-    mapping = {}
-    # check indices up to TOTAL_CONFIG_COUNT
-    for i in range(TOTAL_CONFIG_COUNT):
-        tag = os.getenv(f"BRAND_TAG_{i}") or os.getenv(f"X_BRAND_NAME_{i}") or os.getenv(f"SHOP_NAME_{i}")
-        if tag:
-            mapping[tag] = i
-    return mapping
-
-
-def get_conn_str_for_brand(brand: str):
-    # try brand-indexed env like MYSQL_CONNECT_<i>
-    mapping = brand_index_map()
-    if brand in mapping:
-        i = mapping[brand]
-        val = os.getenv(f"MYSQL_CONNECT_{i}")
-        if val:
-            return val
-
-    # fallback checks (some flexibility)
-    candidates = [
-        f"{brand.upper()}_DATABASE_URL",
-        f"BRAND_{brand.upper()}_DATABASE_URL",
-        f"{brand}_DATABASE_URL",
-    ]
-    for var in candidates:
-        val = os.getenv(var)
-        if val:
-            return val
-    return None
-
-
-def get_brand_indices():
-    """Return list of config indices available."""
-    return range(TOTAL_CONFIG_COUNT)
 
 def fetch_pagespeed_api(brand_key: str, date_str: str) -> dict:
     """Fetch pagespeed data from external API."""
@@ -185,22 +250,17 @@ def fetch_pagespeed_api(brand_key: str, date_str: str) -> dict:
         
     return {}
 
-def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
+def fetch_metrics_for_brand(brand: str, cfg: dict, target_date_str: str) -> dict:
     """Fetch metrics from overall_summary table for a specific date."""
     logger.info(f"[{brand}] Fetching metrics for {target_date_str}...")
-    conn_str = get_conn_str_for_brand(brand)
-    
-    metrics_data = {}
 
-    if not conn_str:
-        logger.error(f"[{brand}] No connection string found.")
-        return {"error": "missing_connection_string"}
+    metrics_data = {}
 
     try:
         # Use helper to get engine with SSL config
         t0 = time.time()
-        engine = get_or_create_engine(conn_str, brand)
-        
+        engine = build_engine(brand, cfg)
+
         with engine.connect() as conn:
             t1 = time.time()
             logger.info(f"[{brand}] DB Connect took {t1 - t0:.2f}s")
@@ -261,21 +321,16 @@ def fetch_metrics_for_brand(brand: str, target_date_str: str) -> dict:
     return metrics_data
 
 
-def fetch_hourly_metrics_for_brand(brand: str, target_date_str: str) -> list:
+def fetch_hourly_metrics_for_brand(brand: str, cfg: dict, target_date_str: str) -> list:
     """Fetch hourly data from hour_wise_sales table for a specific date."""
     logger.info(f"[{brand}] Fetching HOURLY metrics for {target_date_str}...")
-    conn_str = get_conn_str_for_brand(brand)
-    
-    hourly_data = []
 
-    if not conn_str:
-        logger.error(f"[{brand}] No connection string found.")
-        return []
+    hourly_data = []
 
     try:
         # Use helper to get engine with SSL config
         t0 = time.time()
-        engine = get_or_create_engine(conn_str, brand)
+        engine = build_engine(brand, cfg)
         with engine.connect() as conn:
             t1 = time.time()
             logger.info(f"[{brand}] (Hourly) DB Connect took {t1 - t0:.2f}s")
@@ -374,10 +429,12 @@ def fetch_and_cache_all() -> dict:
     2. Cache Anchor + prev 4 days (Total 5).
     3. Delete (Anchor - 5 days).
     """
-    brands_list = BRANDS
-    if not brands_list:
-        brands_list = [f"brand_{i}" for i in range(1, 6)]
-    
+    brand_configs = fetch_active_brands(force_refresh=True)
+    if not brand_configs:
+        logger.warning("No active brands found. Skipping pipeline run.")
+        return {}
+
+    brands_list = list(brand_configs.keys())
     logger.info(f"Pipeline started. Brands to process: {len(brands_list)}")
 
     
@@ -433,12 +490,14 @@ def fetch_and_cache_all() -> dict:
         
         # Schedule Fetches
         for brand in brands_list:
+            cfg = brand_configs[brand]
+
             # Task: Fetch & Cache for 'dates_to_cache'
             for date_str in dates_to_cache:
                 logger.info(f"[{brand}] Triggering fetch for {date_str}...")
-                future = executor.submit(fetch_metrics_for_brand, brand, date_str)
+                future = executor.submit(fetch_metrics_for_brand, brand, cfg, date_str)
                 future_to_item[future] = (brand, date_str, "CACHE")
-            
+
             # Task: Delete 'date_to_delete'
             # We can just do this synchronously or via simple helper, but needs to happen per brand
             # Let's just do it directly here to ensure it runs
@@ -448,7 +507,7 @@ def fetch_and_cache_all() -> dict:
             # Task: Fetch & Cache HOURLY (Today + Yesterday)
             for h_date in hourly_dates:
                 logger.info(f"[{brand}] Triggering HOURLY fetch for {h_date}...")
-                future_h = executor.submit(fetch_hourly_metrics_for_brand, brand, h_date)
+                future_h = executor.submit(fetch_hourly_metrics_for_brand, brand, cfg, h_date)
                 future_to_item[future_h] = (brand, h_date, "HOURLY_CACHE")
 
             # Task: Delete old hourly
@@ -549,7 +608,7 @@ def get_metrics():
     if not brand or not date_str:
         return jsonify({"error": "Missing 'brand' or 'date' query parameter"}), 400
 
-    if brand not in BRANDS:
+    if brand not in fetch_active_brands():
         return jsonify({"error": "Invalid brand"}), 400
 
     cache_key = f"metrics:{brand}:{date_str}"
@@ -591,7 +650,7 @@ def get_metrics():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "brands": BRANDS})
+    return jsonify({"ok": True, "brands": list(fetch_active_brands().keys())})
 
 
 if __name__ == "__main__":

@@ -7,3 +7,5 @@ mysql-connector-python>=8.0
 requests>=2.0
 gunicorn>=20.1
 PyMySQL>=1.0
+pycryptodome>=3.19
+certifi>=2024.0
