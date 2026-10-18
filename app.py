@@ -17,6 +17,7 @@ import concurrent.futures
 import multiprocessing
 import logging
 import time
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -801,6 +802,20 @@ def get_metrics():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "brands": list(fetch_active_brands().keys())})
+
+
+def _run_pipeline_on_startup():
+    try:
+        logger.info("RUN_ON_STARTUP enabled. Running pipeline once at startup...")
+        results = fetch_and_cache_all()
+        logger.info(f"Startup pipeline run completed. Results: {json.dumps(results)}")
+    except Exception:
+        logger.exception("Startup pipeline run failed")
+
+
+if os.getenv("RUN_ON_STARTUP", "false").lower() == "true":
+    # Background thread so gunicorn can boot and serve /health immediately.
+    threading.Thread(target=_run_pipeline_on_startup, name="startup-run", daemon=True).start()
 
 
 if __name__ == "__main__":

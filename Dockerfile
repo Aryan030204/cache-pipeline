@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ENV RUN_ON_STARTUP=true
+
 EXPOSE 8080
 
 CMD ["gunicorn", "app:app", "-b", "0.0.0.0:8080", "--timeout", "180"]
