@@ -617,113 +617,153 @@ def fetch_and_cache_all() -> dict:
     results = {}
 
     # --- 3. Parallel Execution ---
-    with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv("PIPELINE_MAX_WORKERS", "8"))) as executor:
-        future_to_item = {}
+    # Bounded work: the brands are processed a few at a time (PIPELINE_BRAND_BATCH, default 2 = 16 tasks
+    # for 8 threads) and the futures of one batch are collected before the next batch is submitted, so
+    # the queue and the held results never grow with the number of brands.
+    max_workers = max(1, int(os.getenv("PIPELINE_MAX_WORKERS", "8")))
+    brand_batch = max(1, int(os.getenv("PIPELINE_BRAND_BATCH", "2")))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for batch_start in range(0, len(brands_list), brand_batch):
+            brand_chunk = brands_list[batch_start:batch_start + brand_batch]
+            future_to_item = {}
         
-        # Schedule Fetches
-        for brand in brands_list:
-            cfg = brand_configs[brand]
+            # Schedule Fetches
+            for brand in brand_chunk:
+                cfg = brand_configs[brand]
 
-            # Task: Fetch & Cache for 'dates_to_cache'
-            for date_str in dates_to_cache:
-                logger.info(f"[{brand}] Triggering fetch for {date_str}...")
-                future = executor.submit(fetch_metrics_for_brand, brand, cfg, date_str)
-                future_to_item[future] = (brand, date_str, "CACHE")
+                # Task: Fetch & Cache for 'dates_to_cache'
+                for date_str in dates_to_cache:
+                    logger.info(f"[{brand}] Triggering fetch for {date_str}...")
+                    future = executor.submit(fetch_metrics_for_brand, brand, cfg, date_str)
+                    future_to_item[future] = (brand, date_str, "CACHE")
 
-            # Task: Delete 'date_to_delete'
-            # We can just do this synchronously or via simple helper, but needs to happen per brand
-            # Let's just do it directly here to ensure it runs
-            del_key = f"metrics:{brand}:{date_to_delete}"
-            delete_cache_key(del_key)
+                # Task: Delete 'date_to_delete'
+                # We can just do this synchronously or via simple helper, but needs to happen per brand
+                # Let's just do it directly here to ensure it runs
+                del_key = f"metrics:{brand}:{date_to_delete}"
+                delete_cache_key(del_key)
 
-            # Task: Fetch & Cache HOURLY (Today + Yesterday)
-            for h_date in hourly_dates:
-                logger.info(f"[{brand}] Triggering HOURLY fetch for {h_date}...")
-                future_h = executor.submit(fetch_hourly_metrics_for_brand, brand, cfg, h_date)
-                future_to_item[future_h] = (brand, h_date, "HOURLY_CACHE")
+                # Task: Fetch & Cache HOURLY (Today + Yesterday)
+                for h_date in hourly_dates:
+                    logger.info(f"[{brand}] Triggering HOURLY fetch for {h_date}...")
+                    future_h = executor.submit(fetch_hourly_metrics_for_brand, brand, cfg, h_date)
+                    future_to_item[future_h] = (brand, h_date, "HOURLY_CACHE")
 
-            # Task: Delete old hourly
-            del_h_key = f"hourly_metrics:{brand}:{hourly_delete_date}"
-            delete_cache_key(del_h_key)
+                # Task: Delete old hourly
+                del_h_key = f"hourly_metrics:{brand}:{hourly_delete_date}"
+                delete_cache_key(del_h_key)
 
-            # Task: Fetch & Cache date-preset aggregates (7/30/90-day, last month, MTD)
-            future_p = executor.submit(fetch_date_preset_metrics_for_brand, brand, cfg, anchor_date)
-            future_to_item[future_p] = (brand, "date_presets", "DATE_PRESETS")
+                # Task: Fetch & Cache date-preset aggregates (7/30/90-day, last month, MTD)
+                future_p = executor.submit(fetch_date_preset_metrics_for_brand, brand, cfg, anchor_date)
+                future_to_item[future_p] = (brand, "date_presets", "DATE_PRESETS")
 
-        # Process Results
-        for future in concurrent.futures.as_completed(future_to_item):
-            brand, date_str, action = future_to_item[future]
-            try:
-                data = future.result()
+            # Process Results
+            for future in concurrent.futures.as_completed(future_to_item):
+                brand, date_str, action = future_to_item[future]
+                try:
+                    data = future.result()
                 
-                if action == "HOURLY_CACHE":
-                    # Hourly Data Handling
-                    cache_key = f"hourly_metrics:{brand}:{date_str}"
-                    # Data is a list of dicts or empty list
-                    success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
-                    status = "OK_HOURLY" if success else "CACHE_FAIL_HOURLY"
-                    if brand not in results: results[brand] = {}
-                    results[brand][f"{date_str}_hourly"] = status
-                    logger.info(f"[{brand}] Cached HOURLY for {date_str}. Status: {status}")
-                    continue
-
-                if action == "DATE_PRESETS":
-                    if "error" in data:
-                        logger.error(f"[{brand}] Failed to fetch date-preset metrics: {data['error']}")
+                    if action == "HOURLY_CACHE":
+                        # Hourly Data Handling
+                        cache_key = f"hourly_metrics:{brand}:{date_str}"
+                        # Data is a list of dicts or empty list
+                        success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
+                        status = "OK_HOURLY" if success else "CACHE_FAIL_HOURLY"
                         if brand not in results: results[brand] = {}
-                        results[brand]["date_presets"] = f"Error: {data['error']}"
+                        results[brand][f"{date_str}_hourly"] = status
+                        logger.info(f"[{brand}] Cached HOURLY for {date_str}. Status: {status}")
                         continue
 
-                    cache_key = f"date_presets:{brand}"
+                    if action == "DATE_PRESETS":
+                        if "error" in data:
+                            logger.error(f"[{brand}] Failed to fetch date-preset metrics: {data['error']}")
+                            if brand not in results: results[brand] = {}
+                            results[brand]["date_presets"] = f"Error: {data['error']}"
+                            continue
+
+                        cache_key = f"date_presets:{brand}"
+                        success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
+                        status = "OK_PRESETS" if success else "CACHE_FAIL_PRESETS"
+                        if brand not in results: results[brand] = {}
+                        results[brand]["date_presets"] = status
+                        logger.info(f"[{brand}] Cached date presets. Status: {status}")
+                        continue
+
+                    if "error" in data:
+                         logger.error(f"[{brand}] Failed to fetch metrics for {date_str}: {data['error']}")
+                         if brand not in results: results[brand] = {}
+                         results[brand][date_str] = f"Error: {data['error']}"
+                         continue
+                
+                    logger.info(f"[{brand}] Fetched metrics for {date_str}. Now caching...")
+
+                    # Cache
+                    cache_key = f"metrics:{brand}:{date_str}"
+                    # logic: if backfill=false => run normally (cache 5 days)
+                    # logic: if backfill=true => cache target date window
+                    # The user request in point 8 & 9 implies caching always happens effectively unless there's a specific constraint.
+                    # Point 8: "this pipeline cached the data for 13-17th"
+                    # Point 9: "run normally" vs "cache the data of target date and its last five days"
+                    # My 'dates_to_cache' logic covers both cases by adjusting the anchor.
+                
                     success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
-                    status = "OK_PRESETS" if success else "CACHE_FAIL_PRESETS"
+                    status = "OK" if success else "CACHE_FAIL"
+                
+                    if success:
+                        logger.info(f"[{brand}] Successfully cached data for {date_str}. Key: {cache_key}")
+                    else:
+                        logger.error(f"[{brand}] Failed to write to cache for {date_str}.")
+                
                     if brand not in results: results[brand] = {}
-                    results[brand]["date_presets"] = status
-                    logger.info(f"[{brand}] Cached date presets. Status: {status}")
-                    continue
-
-                if "error" in data:
-                     logger.error(f"[{brand}] Failed to fetch metrics for {date_str}: {data['error']}")
-                     if brand not in results: results[brand] = {}
-                     results[brand][date_str] = f"Error: {data['error']}"
-                     continue
+                    results[brand][date_str] = status
                 
-                logger.info(f"[{brand}] Fetched metrics for {date_str}. Now caching...")
-
-                # Cache
-                cache_key = f"metrics:{brand}:{date_str}"
-                # logic: if backfill=false => run normally (cache 5 days)
-                # logic: if backfill=true => cache target date window
-                # The user request in point 8 & 9 implies caching always happens effectively unless there's a specific constraint.
-                # Point 8: "this pipeline cached the data for 13-17th"
-                # Point 9: "run normally" vs "cache the data of target date and its last five days"
-                # My 'dates_to_cache' logic covers both cases by adjusting the anchor.
-                
-                success = atomic_cache_replace(cache_key, data, METRICS_TTL, CACHE_PRESERVE_OLD_SECONDS)
-                status = "OK" if success else "CACHE_FAIL"
-                
-                if success:
-                    logger.info(f"[{brand}] Successfully cached data for {date_str}. Key: {cache_key}")
-                else:
-                    logger.error(f"[{brand}] Failed to write to cache for {date_str}.")
-                
-                if brand not in results: results[brand] = {}
-                results[brand][date_str] = status
-                
-            except Exception as e:
-                logger.error(f"[{brand}] Exception {date_str}: {e}")
-                if brand not in results: results[brand] = {}
-                results[brand][date_str] = str(e)
+                except Exception as e:
+                    logger.error(f"[{brand}] Exception {date_str}: {e}")
+                    if brand not in results: results[brand] = {}
+                    results[brand][date_str] = str(e)
 
     return results
+
+
+# One full cache cycle at a time. A trigger that arrives while a cycle is running is not queued: the
+# running cycle already refreshes every brand/date, and the next ETL completion triggers another.
+_cycle_lock = threading.Lock()
+
+
+def run_cache_cycle_guarded(trigger: str):
+    """Runs fetch_and_cache_all() unless a cycle is already in progress. Returns its results, or None
+    when it was skipped."""
+    if not _cycle_lock.acquire(blocking=False):
+        logger.info(f"Cache cycle ({trigger}) skipped: another cycle is already running.")
+        return None
+    try:
+        results = fetch_and_cache_all()
+        logger.info(f"Cache cycle ({trigger}) completed. Results: {json.dumps(results)}")
+        return results
+    finally:
+        _cycle_lock.release()
+
+
+def _start_cache_cycle(trigger: str):
+    """Starts a cycle in the background and answers immediately (202), or reports one is running (200).
+    ?wait=1 keeps the old synchronous behaviour for manual runs."""
+    if request.args.get("wait") in ("1", "true"):
+        results = run_cache_cycle_guarded(trigger)
+        if results is None:
+            return jsonify({"status": "already_running"}), 200
+        return jsonify({"status": "ok", "results": results})
+
+    if _cycle_lock.locked():
+        logger.info(f"Cache cycle ({trigger}) not started: another cycle is already running.")
+        return jsonify({"status": "already_running"}), 200
+    threading.Thread(target=run_cache_cycle_guarded, args=(trigger,), name=f"cache-cycle-{trigger}", daemon=True).start()
+    return jsonify({"status": "started"}), 202
 
 
 @app.route("/trigger-pipeline", methods=["GET"])
 def manual_trigger():
     logger.info("Received manual pipeline trigger request.")
-    results = fetch_and_cache_all()
-    logger.info(f"Manual pipeline run completed. Results: {json.dumps(results)}")
-    return jsonify({"status": "ok", "results": results})
+    return _start_cache_cycle("trigger")
 
 
 @app.route("/qstash", methods=["POST"])
@@ -742,9 +782,7 @@ def qstash_hook():
         logger.info("Received QStash webhook (No Token Verification enabled).")
 
     logger.info("Starting pipeline execution via QStash trigger...")
-    results = fetch_and_cache_all()
-    logger.info(f"QStash pipeline run completed. Results summary: {json.dumps(results)}")
-    return jsonify({"status": "ok", "results": results})
+    return _start_cache_cycle("qstash")
 
 
 @app.route("/api/metrics", methods=["GET"])
@@ -804,11 +842,16 @@ def health():
     return jsonify({"ok": True, "brands": list(fetch_active_brands().keys())})
 
 
+# Optional startup run (off by default). When enabled it waits STARTUP_DELAY_SECONDS first so a restart of
+# the host does not start every pipeline's work at the same moment, and it uses the same one-cycle guard.
+STARTUP_DELAY_SECONDS = max(0, int(os.getenv("STARTUP_DELAY_SECONDS", "300") or 0))
+
+
 def _run_pipeline_on_startup():
     try:
-        logger.info("RUN_ON_STARTUP enabled. Running pipeline once at startup...")
-        results = fetch_and_cache_all()
-        logger.info(f"Startup pipeline run completed. Results: {json.dumps(results)}")
+        logger.info(f"RUN_ON_STARTUP enabled. Running pipeline once at startup in {STARTUP_DELAY_SECONDS}s...")
+        time.sleep(STARTUP_DELAY_SECONDS)
+        run_cache_cycle_guarded("startup")
     except Exception:
         logger.exception("Startup pipeline run failed")
 

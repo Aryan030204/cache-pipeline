@@ -5,6 +5,18 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # Resource isolation for the shared 4 GiB host: no swap spill (memswap_limit == mem_limit), a CPU
+    # ceiling and a PID cap. One cache cycle runs at a time and brands are processed in bounded batches
+    # (PIPELINE_BRAND_BATCH / PIPELINE_MAX_WORKERS), so this ceiling is not expected to be reached.
+    mem_limit: ${CACHE_PIPELINE_MEM_LIMIT:-512m}
+    memswap_limit: ${CACHE_PIPELINE_MEM_LIMIT:-512m}
+    cpus: ${CACHE_PIPELINE_CPUS:-1.0}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     ports:
       - "8080:8080"
     networks:
